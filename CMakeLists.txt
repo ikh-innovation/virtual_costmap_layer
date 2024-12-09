@@ -91,7 +91,7 @@ catkin_package(INCLUDE_DIRS
 
 add_subdirectory(third-party)
 
-include_directories(${CMAKE_BINARY_DIR}/include ${CMAKE_SOURCE_DIR}/third-party ${catkin_INCLUDE_DIRS} include)
+include_directories(${CMAKE_BINARY_DIR}/include ${CMAKE_CURRENT_LIST_DIR}/third-party ${catkin_INCLUDE_DIRS} include)
 
 add_library(virtual_layer src/virtual_layer.cpp src/tessellator.cpp)
 target_link_libraries(virtual_layer ${catkin_LIBRARIES} Boost::boost third-party)

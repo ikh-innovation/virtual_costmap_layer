@@ -10,4 +10,4 @@ include(DownloadProject)
 # ##############################################################################
 
 add_subdirectory(docopt.cpp)
-add_subdirectory(nlohmann_json)
+# add_subdirectory(nlohmann_json)
