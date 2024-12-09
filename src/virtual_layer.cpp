@@ -92,6 +92,35 @@ void VirtualLayer::onInitialize()
 
 bool VirtualLayer::addElement(virtual_costmap_layer::AddElementRequest& req, virtual_costmap_layer::AddElementResponse& res)
 {
+    bool duplicate_uuid = false;
+
+    auto process = [this, &duplicate_uuid, &req]() {
+        if (_geometries[GeometryType::LINESTRING].find(req.form.uuid) != _geometries[GeometryType::LINESTRING].end()) {
+            duplicate_uuid = true;
+        }
+        if (_geometries[GeometryType::RING].find(req.form.uuid) != _geometries[GeometryType::RING].end()) {
+            duplicate_uuid = true;
+        }
+        if (_geometries[GeometryType::RING].find(req.form.uuid) != _geometries[GeometryType::RING].end()) {
+            duplicate_uuid = true;
+        }
+        if (_geometries[GeometryType::CIRCLE].find(req.form.uuid) != _geometries[GeometryType::CIRCLE].end()) {
+            duplicate_uuid = true;
+        }
+    };
+
+    if (!req.form.uuid.empty())
+    {
+        process();
+        if (duplicate_uuid)
+        {
+            res.success = false;
+            res.message = "Add element failed: [reason: duplicate uuid]";
+            ROS_WARN_STREAM(tag << res.message);
+            return true;
+        }
+    }    
+
     GeometryType type;
     switch (req.form.type) {
         case virtual_costmap_layer::Form::TYPE_LINESTRING:
@@ -132,7 +161,7 @@ bool VirtualLayer::addElement(virtual_costmap_layer::AddElementRequest& req, vir
                     ROS_WARN_STREAM(tag << res.message);
                     return true;
                 }
-                const auto uuid = saveLineStringGeometry(linestring);
+                const auto uuid = saveLineStringGeometry(linestring, req.form.uuid);
                 res.success = true;
                 res.uuid = uuid;
             } else {
@@ -163,7 +192,7 @@ bool VirtualLayer::addElement(virtual_costmap_layer::AddElementRequest& req, vir
                     return true;
                 }
 
-                const auto uuid = savePolygonGeometry(polygon);
+                const auto uuid = savePolygonGeometry(polygon, req.form.uuid);
                 res.success = true;
                 res.uuid = uuid;
             } else {
@@ -201,7 +230,7 @@ bool VirtualLayer::addElement(virtual_costmap_layer::AddElementRequest& req, vir
                     return true;
                 }
 
-                const auto uuid = savePolygonGeometry(polygon);
+                const auto uuid = savePolygonGeometry(polygon, req.form.uuid);
                 res.success = true;
                 res.uuid = uuid;
             } else {
@@ -402,9 +431,33 @@ void VirtualLayer::parseFormListFromYaml(const ros::NodeHandle& nh)
 
 // ---------------------------------------------------------------------
 
-std::string VirtualLayer::saveLineStringGeometry(const rgk::core::LineString& linestring)
+std::string VirtualLayer::saveLineStringGeometry(const rgk::core::LineString& linestring, std::string uuid)
 {
-    const auto uuid = getUUID();
+    if (uuid.empty())
+    {
+        auto process = [this, &uuid]() {
+            if (_geometries[GeometryType::LINESTRING].find(uuid) != _geometries[GeometryType::LINESTRING].end()) {
+                return false;
+            }
+            if (_geometries[GeometryType::RING].find(uuid) != _geometries[GeometryType::RING].end()) {
+                return false;
+            }
+            if (_geometries[GeometryType::RING].find(uuid) != _geometries[GeometryType::RING].end()) {
+                return false;
+            }
+            if (_geometries[GeometryType::CIRCLE].find(uuid) != _geometries[GeometryType::CIRCLE].end()) {
+                return false;
+            }
+            return true;
+        };
+
+        uuid = getUUID();
+        while(not process())
+        {
+            uuid = getUUID();
+        }        
+    }
+
     Geometry geometry;
     geometry._linestring = linestring;
     ROS_INFO_STREAM(tag << "Adding LineString [uuid: " << uuid << "]");
@@ -415,9 +468,32 @@ std::string VirtualLayer::saveLineStringGeometry(const rgk::core::LineString& li
 
 // ---------------------------------------------------------------------
 
-std::string VirtualLayer::savePolygonGeometry(const rgk::core::Polygon& polygon)
+std::string VirtualLayer::savePolygonGeometry(const rgk::core::Polygon& polygon, std::string uuid)
 {
-    const auto uuid = getUUID();
+    if (uuid.empty())
+    {
+        auto process = [this, &uuid]() {
+            if (_geometries[GeometryType::LINESTRING].find(uuid) != _geometries[GeometryType::LINESTRING].end()) {
+                return false;
+            }
+            if (_geometries[GeometryType::RING].find(uuid) != _geometries[GeometryType::RING].end()) {
+                return false;
+            }
+            if (_geometries[GeometryType::RING].find(uuid) != _geometries[GeometryType::RING].end()) {
+                return false;
+            }
+            if (_geometries[GeometryType::CIRCLE].find(uuid) != _geometries[GeometryType::CIRCLE].end()) {
+                return false;
+            }
+            return true;
+        };
+
+        uuid = getUUID();
+        while(not process())
+        {
+            uuid = getUUID();
+        }        
+    }
 
     Geometry geometry;
 

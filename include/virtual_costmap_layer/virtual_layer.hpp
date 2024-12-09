@@ -165,12 +165,12 @@ class VirtualLayer : public costmap_2d::Layer {
     /// \brief             save linestring element type in virtual costmap layer geometries
     /// \param linestring  linestring data
     /// \return uuid of element
-    std::string saveLineStringGeometry(const rgk::core::LineString& linestring);
+    std::string saveLineStringGeometry(const rgk::core::LineString& linestring, std::string uuid = "");
 
     /// \brief             save polygon element type in virtual costmap layer forms
     /// \param polygon     polygon data
     /// \return uuid of element
-    std::string savePolygonGeometry(const rgk::core::Polygon& polygon);
+    std::string savePolygonGeometry(const rgk::core::Polygon& polygon, std::string uuid = "");
 
     /// \brief             convert a geometry element to a form message
     /// \param geometry    geometry element
