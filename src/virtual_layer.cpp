@@ -82,7 +82,7 @@ void VirtualLayer::onInitialize()
     ROS_INFO_STREAM("Tessellation: " << _enable_tessellation ? "true" : "false");
 
     // reading the defined forms out of the namespace of this plugin!
-    parseFormListFromYaml(nh);
+    // parseFormListFromYaml(nh);
 
     // compute map bounds for the current set of areas and obstacles.
     computeMapBounds();
