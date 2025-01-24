@@ -248,6 +248,8 @@ bool VirtualLayer::addElement(virtual_costmap_layer::AddElementRequest& req, vir
             return true;
     }
 
+    computeMapBounds();
+
     return true;
 }
 
@@ -261,6 +263,7 @@ bool VirtualLayer::removeElement(virtual_costmap_layer::RemoveElementRequest& re
         if (_geometries[type].find(req.uuid) != _geometries[type].end()) {
             deleted = true;
             _geometries[type].erase(req.uuid);
+            computeMapBounds();
         }
     };
 
@@ -305,7 +308,7 @@ bool VirtualLayer::clear(std_srvs::TriggerRequest& req, std_srvs::TriggerRespons
     _geometries[GeometryType::POLYGON].clear();
     _geometries[GeometryType::RING].clear();
     _geometries[GeometryType::CIRCLE].clear();
-
+    computeMapBounds();
     res.success = true;
     return true;
 }
