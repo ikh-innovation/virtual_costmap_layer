@@ -95,7 +95,7 @@ include_directories(${CMAKE_BINARY_DIR}/include ${CMAKE_CURRENT_LIST_DIR}/third-
 
 add_library(virtual_layer src/virtual_layer.cpp src/tessellator.cpp)
 target_link_libraries(virtual_layer ${catkin_LIBRARIES} Boost::boost third-party)
-add_dependencies(virtual_layer ${PROJECT_NAME}_gencfg ${catkin_EXPORTED_TARGETS})
+add_dependencies(virtual_layer ${PROJECT_NAME}_gencfg ${PROJECT_NAME}_generate_messages_cpp ${catkin_EXPORTED_TARGETS})
 
 add_executable(interface src/version.cpp)
 target_link_libraries(interface PRIVATE docopt_s nlohmann_json::nlohmann_json)
