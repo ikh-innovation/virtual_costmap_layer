@@ -64,7 +64,8 @@ void VirtualLayer::onInitialize()
     _costmap_resolution = layered_costmap_->getCostmap()->getResolution();
 
     // set initial bounds
-    _min_x = _min_y = _max_x = _max_y = 0;
+    _min_x = _min_y = 1e30;
+    _max_x = _max_y = -1e30;
 
     // advertising services
     _add_server = nh.advertiseService("add", &VirtualLayer::addElement, this);
@@ -892,7 +893,8 @@ void VirtualLayer::computeMapBounds()
     std::lock_guard<std::mutex> l(_data_mutex);
 
     // reset bounds
-    _min_x = _min_y = _max_x = _max_y = 0;
+    _min_x = _min_y = 1e30;
+    _max_x = _max_y = -1e30;
 
     // iterate on polygons
     for (const auto& pair : _geometries[GeometryType::POLYGON]) {
