@@ -43,6 +43,7 @@ struct Geometry {
     std::optional<rgk::core::Ring> _ring;
     std::optional<std::vector<rgk::core::Ring>> _tessellated_ring;
     bool _tessellated = false;
+    bool _new = false;
 };
 
 struct PointInt {
@@ -190,6 +191,7 @@ class VirtualLayer : public costmap_2d::Layer {
     std::string _map_frame;  // map frame by default "map"
 
     std::map<GeometryType, std::map<std::string, Geometry>> _geometries; // map of saved geometry element of virtual layer
+    std::map<GeometryType, std::map<std::string, Geometry>> _to_be_deleted_geometries; // map of soon to be deleted geometry element of virtual layer
 
     double _min_x, _min_y, _max_x, _max_y; // cached map bounds
 

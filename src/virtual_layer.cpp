@@ -64,7 +64,8 @@ void VirtualLayer::onInitialize()
     _costmap_resolution = layered_costmap_->getCostmap()->getResolution();
 
     // set initial bounds
-    _min_x = _min_y = _max_x = _max_y = 0;
+    // _min_x = _min_y = 1e30;
+    // _max_x = _max_y = -1e30;
 
     // advertising services
     _add_server = nh.advertiseService("add", &VirtualLayer::addElement, this);
@@ -78,6 +79,21 @@ void VirtualLayer::onInitialize()
     _geometries.insert(std::make_pair(GeometryType::RING, std::map<std::string, Geometry>()));
     _geometries.insert(std::make_pair(GeometryType::CIRCLE, std::map<std::string, Geometry>()));
 
+    _geometries[GeometryType::LINESTRING].clear();
+    _geometries[GeometryType::POLYGON].clear();
+    _geometries[GeometryType::RING].clear();
+    _geometries[GeometryType::CIRCLE].clear();
+
+    _to_be_deleted_geometries.insert(std::make_pair(GeometryType::LINESTRING, std::map<std::string, Geometry>()));
+    _to_be_deleted_geometries.insert(std::make_pair(GeometryType::POLYGON, std::map<std::string, Geometry>()));
+    _to_be_deleted_geometries.insert(std::make_pair(GeometryType::RING, std::map<std::string, Geometry>()));
+    _to_be_deleted_geometries.insert(std::make_pair(GeometryType::CIRCLE, std::map<std::string, Geometry>()));
+
+    _to_be_deleted_geometries[GeometryType::LINESTRING].clear();
+    _to_be_deleted_geometries[GeometryType::POLYGON].clear();
+    _to_be_deleted_geometries[GeometryType::RING].clear();
+    _to_be_deleted_geometries[GeometryType::CIRCLE].clear();
+
     nh.getParam("tessellation/enabled", _enable_tessellation);
     ROS_INFO_STREAM("Tessellation: " << _enable_tessellation ? "true" : "false");
 
@@ -85,13 +101,15 @@ void VirtualLayer::onInitialize()
     // parseFormListFromYaml(nh);
 
     // compute map bounds for the current set of areas and obstacles.
-    computeMapBounds();
+    // computeMapBounds();
 }
 
 // ---------------------------------------------------------------------
 
 bool VirtualLayer::addElement(virtual_costmap_layer::AddElementRequest& req, virtual_costmap_layer::AddElementResponse& res)
 {
+    std::lock_guard<std::mutex> l(_data_mutex);
+
     bool duplicate_uuid = false;
 
     auto process = [this, &duplicate_uuid, &req]() {
@@ -248,7 +266,7 @@ bool VirtualLayer::addElement(virtual_costmap_layer::AddElementRequest& req, vir
             return true;
     }
 
-    computeMapBounds();
+    // computeMapBounds();
 
     return true;
 }
@@ -257,13 +275,16 @@ bool VirtualLayer::addElement(virtual_costmap_layer::AddElementRequest& req, vir
 
 bool VirtualLayer::removeElement(virtual_costmap_layer::RemoveElementRequest& req, virtual_costmap_layer::RemoveElementResponse& res)
 {
+    std::lock_guard<std::mutex> l(_data_mutex);
+
     bool deleted = false;
 
     auto process = [this, &deleted, &req](GeometryType type) {
-        if (_geometries[type].find(req.uuid) != _geometries[type].end()) {
+        if (_geometries[type].find(req.uuid) != _geometries[type].end()) {            
             deleted = true;
+            _to_be_deleted_geometries[type].insert(std::make_pair(req.uuid, _geometries[type][req.uuid]));
             _geometries[type].erase(req.uuid);
-            computeMapBounds();
+            // computeMapBounds();
         }
     };
 
@@ -302,13 +323,22 @@ bool VirtualLayer::removeElement(virtual_costmap_layer::RemoveElementRequest& re
 
 bool VirtualLayer::clear(std_srvs::TriggerRequest& req, std_srvs::TriggerResponse& res)
 {
-
     ROS_INFO_STREAM(tag << "Clearing layer");
+
+    std::lock_guard<std::mutex> l(_data_mutex);
+    
+    for (auto& geometry : _geometries) {
+        for (auto& item : geometry.second) {
+            _to_be_deleted_geometries[geometry.first].insert(item);
+        }
+    }
+
     _geometries[GeometryType::LINESTRING].clear();
     _geometries[GeometryType::POLYGON].clear();
     _geometries[GeometryType::RING].clear();
     _geometries[GeometryType::CIRCLE].clear();
-    computeMapBounds();
+
+    // computeMapBounds();
     res.success = true;
     return true;
 }
@@ -317,6 +347,8 @@ bool VirtualLayer::clear(std_srvs::TriggerRequest& req, std_srvs::TriggerRespons
 
 bool VirtualLayer::getElement(virtual_costmap_layer::GetElementRequest& req, virtual_costmap_layer::GetElementResponse& res)
 {
+    std::lock_guard<std::mutex> l(_data_mutex);
+
     bool found = false;
 
     auto process = [this, &found, &req, &res](GeometryType type) {
@@ -360,6 +392,8 @@ bool VirtualLayer::getElement(virtual_costmap_layer::GetElementRequest& req, vir
 
 bool VirtualLayer::getElements(virtual_costmap_layer::GetElementsRequest& req, virtual_costmap_layer::GetElementsResponse& res)
 {
+    std::lock_guard<std::mutex> l(_data_mutex);
+    
     res.forms = toForms();
     return true;
 }
@@ -463,6 +497,7 @@ std::string VirtualLayer::saveLineStringGeometry(const rgk::core::LineString& li
 
     Geometry geometry;
     geometry._linestring = linestring;
+    geometry._new = true;
     ROS_INFO_STREAM(tag << "Adding LineString [uuid: " << uuid << "]");
     _geometries[GeometryType::LINESTRING].insert(std::make_pair(uuid, geometry));
 
@@ -499,6 +534,7 @@ std::string VirtualLayer::savePolygonGeometry(const rgk::core::Polygon& polygon,
     }
 
     Geometry geometry;
+    geometry._new = true;
 
     if (polygon.outer().empty() && polygon.inners().size() == 1) {
         if (_enable_tessellation) {
@@ -621,9 +657,16 @@ void VirtualLayer::updateBounds(double robot_x, double robot_y, double robot_yaw
                 _geometries.at(GeometryType::RING).size() +
                 _geometries.at(GeometryType::CIRCLE).size();
 
-    if (size == 0) {
+    auto to_be_deleted_size = _to_be_deleted_geometries.at(GeometryType::LINESTRING).size() +
+                                _to_be_deleted_geometries.at(GeometryType::POLYGON).size() +
+                                _to_be_deleted_geometries.at(GeometryType::RING).size() +
+                                _to_be_deleted_geometries.at(GeometryType::CIRCLE).size();
+
+    if (size == 0 && to_be_deleted_size == 0) {
         return;
     }
+
+    computeMapBounds();
 
     *min_x = std::min(*min_x, _min_x);
     *min_y = std::min(*min_y, _min_y);
@@ -889,13 +932,41 @@ void VirtualLayer::raytrace(int x0, int y0, int x1, int y1, std::vector<PointInt
 
 void VirtualLayer::computeMapBounds()
 {
-    std::lock_guard<std::mutex> l(_data_mutex);
+    // std::lock_guard<std::mutex> l(_data_mutex);
 
     // reset bounds
-    _min_x = _min_y = _max_x = _max_y = 0;
+    _min_x = _min_y = 1e30;
+    _max_x = _max_y = -1e30;
 
     // iterate on polygons
-    for (const auto& pair : _geometries[GeometryType::POLYGON]) {
+    for (auto& pair : _geometries[GeometryType::POLYGON]) {
+        if (pair.second._polygon && pair.second._new) {
+            for (const auto& point : pair.second._polygon.value().outer()) {
+                double px = boost::geometry::get<0>(point);
+                double py = boost::geometry::get<1>(point);
+                _min_x = std::min(px, _min_x);
+                _min_y = std::min(py, _min_y);
+                _max_x = std::max(px, _max_x);
+                _max_y = std::max(py, _max_y);
+            }
+
+            for (const auto& inner : pair.second._polygon.value().inners()) {
+                for (const auto& point : inner) {
+                    double px = boost::geometry::get<0>(point);
+                    double py = boost::geometry::get<1>(point);
+                    _min_x = std::min(px, _min_x);
+                    _min_y = std::min(py, _min_y);
+                    _max_x = std::max(px, _max_x);
+                    _max_y = std::max(py, _max_y);
+                }
+            }
+
+            pair.second._new = false;
+        }
+    }
+
+    // iterate on soon to be deleted polygons
+    for (const auto& pair : _to_be_deleted_geometries[GeometryType::POLYGON]) {
         if (pair.second._polygon) {
             for (const auto& point : pair.second._polygon.value().outer()) {
                 double px = boost::geometry::get<0>(point);
@@ -918,9 +989,39 @@ void VirtualLayer::computeMapBounds()
             }
         }
     }
+    _to_be_deleted_geometries[GeometryType::POLYGON].clear();
 
     // iterate on rings
-    for (const auto& pair : _geometries[GeometryType::RING]) {
+    for (auto& pair : _geometries[GeometryType::RING]) {
+        if (pair.second._ring && pair.second._new) {
+            if (!pair.second._tessellated) {
+                for (const auto& point : pair.second._ring.value()) {
+                    double px = boost::geometry::get<0>(point);
+                    double py = boost::geometry::get<1>(point);
+                    _min_x = std::min(px, _min_x);
+                    _min_y = std::min(py, _min_y);
+                    _max_x = std::max(px, _max_x);
+                    _max_y = std::max(py, _max_y);
+                }
+            } else if (pair.second._tessellated_ring) {
+                for (const auto& ring : pair.second._tessellated_ring.value()) {
+                    for (const auto& point : pair.second._ring.value()) {
+                        double px = boost::geometry::get<0>(point);
+                        double py = boost::geometry::get<1>(point);
+                        _min_x = std::min(px, _min_x);
+                        _min_y = std::min(py, _min_y);
+                        _max_x = std::max(px, _max_x);
+                        _max_y = std::max(py, _max_y);
+                    }
+                }
+            }
+
+            pair.second._new = false;
+        }
+    }
+
+    // iterate on soon to be deleted rings
+    for (const auto& pair : _to_be_deleted_geometries[GeometryType::RING]) {
         if (pair.second._ring) {
             if (!pair.second._tessellated) {
                 for (const auto& point : pair.second._ring.value()) {
@@ -945,9 +1046,27 @@ void VirtualLayer::computeMapBounds()
             }
         }
     }
+    _to_be_deleted_geometries[GeometryType::RING].clear();
 
     // iterate on linestrings
-    for (const auto& pair : _geometries[GeometryType::LINESTRING]) {
+    for (auto& pair : _geometries[GeometryType::LINESTRING]) {
+        if (pair.second._linestring && pair.second._new) {
+            for (const auto& point : pair.second._linestring.value()) {
+                double px = boost::geometry::get<0>(point);
+                double py = boost::geometry::get<1>(point);
+                _min_x = std::min(px, _min_x);
+                _min_y = std::min(py, _min_y);
+                _max_x = std::max(px, _max_x);
+                _max_y = std::max(py, _max_y);
+            }
+
+            pair.second._new = false;
+        }
+    }
+
+    // iterate on soon to be deleted linestrings
+
+    for (const auto& pair : _to_be_deleted_geometries[GeometryType::LINESTRING]) {
         if (pair.second._linestring) {
             for (const auto& point : pair.second._linestring.value()) {
                 double px = boost::geometry::get<0>(point);
@@ -959,6 +1078,7 @@ void VirtualLayer::computeMapBounds()
             }
         }
     }
+    _to_be_deleted_geometries[GeometryType::LINESTRING].clear();
 }
 
 } // namespace virtual_costmap_layer
