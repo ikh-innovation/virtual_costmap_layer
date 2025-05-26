@@ -646,10 +646,6 @@ void VirtualLayer::reconfigureCb(VirtualLayerConfig& config, uint32_t level)
 void VirtualLayer::updateBounds(double robot_x, double robot_y, double robot_yaw,
                                 double* min_x, double* min_y, double* max_x, double* max_y)
 {
-    if (!enabled_) {
-        return;
-    }
-
     std::lock_guard<std::mutex> l(_data_mutex);
 
     auto size = _geometries.at(GeometryType::LINESTRING).size() +
@@ -666,7 +662,9 @@ void VirtualLayer::updateBounds(double robot_x, double robot_y, double robot_yaw
         return;
     }
 
-    computeMapBounds();
+    computeMapBounds(_last_enabled != enabled_);
+    
+    _last_enabled = enabled_;
 
     *min_x = std::min(*min_x, _min_x);
     *min_y = std::min(*min_y, _min_y);
@@ -930,7 +928,7 @@ void VirtualLayer::raytrace(int x0, int y0, int x1, int y1, std::vector<PointInt
 
 // ---------------------------------------------------------------------
 
-void VirtualLayer::computeMapBounds()
+void VirtualLayer::computeMapBounds(bool include_all)
 {
     // std::lock_guard<std::mutex> l(_data_mutex);
 
@@ -940,7 +938,7 @@ void VirtualLayer::computeMapBounds()
 
     // iterate on polygons
     for (auto& pair : _geometries[GeometryType::POLYGON]) {
-        if (pair.second._polygon && pair.second._new) {
+        if (pair.second._polygon && (pair.second._new || include_all)) {
             for (const auto& point : pair.second._polygon.value().outer()) {
                 double px = boost::geometry::get<0>(point);
                 double py = boost::geometry::get<1>(point);
@@ -993,7 +991,7 @@ void VirtualLayer::computeMapBounds()
 
     // iterate on rings
     for (auto& pair : _geometries[GeometryType::RING]) {
-        if (pair.second._ring && pair.second._new) {
+        if (pair.second._ring && (pair.second._new || include_all)) {
             if (!pair.second._tessellated) {
                 for (const auto& point : pair.second._ring.value()) {
                     double px = boost::geometry::get<0>(point);
@@ -1050,7 +1048,7 @@ void VirtualLayer::computeMapBounds()
 
     // iterate on linestrings
     for (auto& pair : _geometries[GeometryType::LINESTRING]) {
-        if (pair.second._linestring && pair.second._new) {
+        if (pair.second._linestring && (pair.second._new || include_all)) {
             for (const auto& point : pair.second._linestring.value()) {
                 double px = boost::geometry::get<0>(point);
                 double py = boost::geometry::get<1>(point);

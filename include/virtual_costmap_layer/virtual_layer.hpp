@@ -75,7 +75,7 @@ class VirtualLayer : public costmap_2d::Layer {
 
     //// \brief computes bounds in world coordinates for the current set of points and polygons.
     ///        the result is stored in class members _min_x, _min_y, _max_x and _max_y.
-    void computeMapBounds();
+    void computeMapBounds(bool include_all=false);
 
     /// \brief                set cost in a Costmap2D for a ring (ring may be located outside bounds)
     /// \param grid           reference to the Costmap2D object
@@ -196,6 +196,7 @@ class VirtualLayer : public costmap_2d::Layer {
     double _min_x, _min_y, _max_x, _max_y; // cached map bounds
 
     bool _enable_tessellation {false};
+    bool _last_enabled {false};
 
     ros::ServiceServer _add_server;    // RPC service to add element
     ros::ServiceServer _remove_server; // RPC service to remove element
