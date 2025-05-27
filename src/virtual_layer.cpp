@@ -116,7 +116,7 @@ bool VirtualLayer::addElement(virtual_costmap_layer::AddElementRequest& req, vir
         if (_geometries[GeometryType::LINESTRING].find(req.form.uuid) != _geometries[GeometryType::LINESTRING].end()) {
             duplicate_uuid = true;
         }
-        if (_geometries[GeometryType::RING].find(req.form.uuid) != _geometries[GeometryType::RING].end()) {
+        if (_geometries[GeometryType::POLYGON].find(req.form.uuid) != _geometries[GeometryType::POLYGON].end()) {
             duplicate_uuid = true;
         }
         if (_geometries[GeometryType::RING].find(req.form.uuid) != _geometries[GeometryType::RING].end()) {
