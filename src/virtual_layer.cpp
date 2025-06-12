@@ -1,4 +1,16 @@
-#include "virtual_costmap_layer/virtual_layer.hpp"
+// Copyright (C) Mahmoud Ghorbel - All Rights Reserved
+// Unauthorized copying of this file, via any medium is strictly prohibited
+// Proprietary and confidential
+// Written by MG <mahmoud.ghorbel@hotmail.com>
+
+#include <sstream>
+
+#include <virtual_costmap_layer/tessellator.hpp>
+#include <virtual_costmap_layer/virtual_layer.hpp>
+
+#include <boost/geometry.hpp>
+#include <boost/uuid/random_generator.hpp>
+#include <boost/uuid/uuid_io.hpp>
 
 #include <geometry_msgs/Pose.h>
 #include <pluginlib/class_list_macros.h>
@@ -9,6 +21,12 @@
 PLUGINLIB_EXPORT_CLASS(virtual_costmap_layer::VirtualLayer, costmap_2d::Layer);
 
 static const std::string tag {"[VIRTUAL-LAYER] "};
+
+static const std::string getUUID()
+{
+    boost::uuids::random_generator generator;
+    return (boost::uuids::to_string(generator()));
+}
 
 namespace virtual_costmap_layer {
 
@@ -36,8 +54,6 @@ void VirtualLayer::onInitialize()
 
     _base_frame = "base_link";
     _map_frame = "map";
-    _one_zone_mode = true;
-    _clear_obstacles = true;
 
     _dsrv = std::make_shared<dynamic_reconfigure::Server<VirtualLayerConfig>>(nh);
 
@@ -48,148 +64,403 @@ void VirtualLayer::onInitialize()
     _costmap_resolution = layered_costmap_->getCostmap()->getResolution();
 
     // set initial bounds
-    _min_x = _min_y = _max_x = _max_y = 0;
+    // _min_x = _min_y = 1e30;
+    // _max_x = _max_y = -1e30;
 
-    // reading the defined topics out of the namespace of this plugin!
-    std::string param {"zone_topics"};
-    parseTopicsFromYaml(nh, param);
-    param = "obstacle_topics";
-    parseTopicsFromYaml(nh, param);
+    // advertising services
+    _add_server = nh.advertiseService("add", &VirtualLayer::addElement, this);
+    _remove_server = nh.advertiseService("remove", &VirtualLayer::removeElement, this);
+    _get_server = nh.advertiseService("get", &VirtualLayer::getElement, this);
+    _status_server = nh.advertiseService("status", &VirtualLayer::getElements, this);
+    _clear_server = nh.advertiseService("clear", &VirtualLayer::clear, this);
+
+    _geometries.insert(std::make_pair(GeometryType::LINESTRING, std::map<std::string, Geometry>()));
+    _geometries.insert(std::make_pair(GeometryType::POLYGON, std::map<std::string, Geometry>()));
+    _geometries.insert(std::make_pair(GeometryType::RING, std::map<std::string, Geometry>()));
+    _geometries.insert(std::make_pair(GeometryType::CIRCLE, std::map<std::string, Geometry>()));
+
+    _geometries[GeometryType::LINESTRING].clear();
+    _geometries[GeometryType::POLYGON].clear();
+    _geometries[GeometryType::RING].clear();
+    _geometries[GeometryType::CIRCLE].clear();
+
+    _to_be_deleted_geometries.insert(std::make_pair(GeometryType::LINESTRING, std::map<std::string, Geometry>()));
+    _to_be_deleted_geometries.insert(std::make_pair(GeometryType::POLYGON, std::map<std::string, Geometry>()));
+    _to_be_deleted_geometries.insert(std::make_pair(GeometryType::RING, std::map<std::string, Geometry>()));
+    _to_be_deleted_geometries.insert(std::make_pair(GeometryType::CIRCLE, std::map<std::string, Geometry>()));
+
+    _to_be_deleted_geometries[GeometryType::LINESTRING].clear();
+    _to_be_deleted_geometries[GeometryType::POLYGON].clear();
+    _to_be_deleted_geometries[GeometryType::RING].clear();
+    _to_be_deleted_geometries[GeometryType::CIRCLE].clear();
+
+    nh.getParam("tessellation/enabled", _enable_tessellation);
+    ROS_INFO_STREAM("Tessellation: " << _enable_tessellation ? "true" : "false");
 
     // reading the defined forms out of the namespace of this plugin!
-    param = "forms";
-    parseFormListFromYaml(nh, param);
+    // parseFormListFromYaml(nh);
 
     // compute map bounds for the current set of areas and obstacles.
-    computeMapBounds();
-
-    ROS_INFO_STREAM(tag << "layer is initialized: [points: " << _form_points.size() << "] [polygons: " << _form_polygons.size() << "]");
+    // computeMapBounds();
 }
 
 // ---------------------------------------------------------------------
 
-void VirtualLayer::parseTopicsFromYaml(ros::NodeHandle &nh, const std::string &param)
+bool VirtualLayer::addElement(virtual_costmap_layer::AddElementRequest& req, virtual_costmap_layer::AddElementResponse& res)
 {
-    XmlRpc::XmlRpcValue param_yaml;
-    if (nh.getParam(param, param_yaml)) {
-        if ((param_yaml.valid() == false) || (param_yaml.getType() != XmlRpc::XmlRpcValue::TypeArray)) {
-            ROS_ERROR_STREAM(tag << "invalid topic names list: it must be a non-empty list of strings");
-            throw std::runtime_error("invalid topic names list: it must be a non-empty list of strings");
-        }
+    std::lock_guard<std::mutex> l(_data_mutex);
 
-        if (param_yaml.size() == 0) {
-            ROS_WARN_STREAM(tag << "empty topic names list: virtual layer will have no effect on costmap");
-        }
+    bool duplicate_uuid = false;
 
-        for (std::size_t i = 0; i < param_yaml.size(); ++i) {
-            if (param_yaml[i].getType() != XmlRpc::XmlRpcValue::TypeString) {
-                ROS_WARN_STREAM(tag << "invalid topic names list: element " << i << " is not a string, so it will be ignored");
+    auto process = [this, &duplicate_uuid, &req]() {
+        if (_geometries[GeometryType::LINESTRING].find(req.form.uuid) != _geometries[GeometryType::LINESTRING].end()) {
+            duplicate_uuid = true;
+        }
+        if (_geometries[GeometryType::POLYGON].find(req.form.uuid) != _geometries[GeometryType::POLYGON].end()) {
+            duplicate_uuid = true;
+        }
+        if (_geometries[GeometryType::RING].find(req.form.uuid) != _geometries[GeometryType::RING].end()) {
+            duplicate_uuid = true;
+        }
+        if (_geometries[GeometryType::CIRCLE].find(req.form.uuid) != _geometries[GeometryType::CIRCLE].end()) {
+            duplicate_uuid = true;
+        }
+    };
+
+    if (!req.form.uuid.empty())
+    {
+        process();
+        if (duplicate_uuid)
+        {
+            res.success = false;
+            res.message = "Add element failed: [reason: duplicate uuid]";
+            ROS_WARN_STREAM(tag << res.message);
+            return true;
+        }
+    }    
+
+    GeometryType type;
+    switch (req.form.type) {
+        case virtual_costmap_layer::Form::TYPE_LINESTRING:
+            type = GeometryType::LINESTRING;
+            break;
+        case virtual_costmap_layer::Form::TYPE_POLYGON:
+            type = GeometryType::POLYGON;
+            break;
+        case virtual_costmap_layer::Form::TYPE_RING:
+            type = GeometryType::RING;
+            break;
+        case virtual_costmap_layer::Form::TYPE_CIRCLE:
+            type = GeometryType::CIRCLE;
+            break;
+        default:
+            res.success = false;
+            res.message = "Unsupported type request (" + std::to_string(req.form.type) + ")";
+            return true;
+    }
+
+    switch (type) {
+        case GeometryType::LINESTRING: {
+            auto has_form = req.form.data.find("LINESTRING");
+            if (has_form != std::string::npos) {
+                rgk::core::LineString linestring;
+                try {
+                    boost::geometry::read_wkt(req.form.data, linestring);
+                } catch (...) {
+                    res.success = false;
+                    res.message = "Add element failed: [reason: request data corrupted]";
+                    ROS_WARN_STREAM(tag << res.message);
+                    return true;
+                }
+                boost::geometry::correct(linestring);
+                if (linestring.empty()) {
+                    res.success = false;
+                    res.message = "Add element failed: [reason: request data empty]";
+                    ROS_WARN_STREAM(tag << res.message);
+                    return true;
+                }
+                const auto uuid = saveLineStringGeometry(linestring, req.form.uuid);
+                res.success = true;
+                res.uuid = uuid;
             } else {
-                std::string topic_name(param_yaml[i]);
-                if ((topic_name.empty()) && (topic_name.at(0) != '/')) {
-                    topic_name = "/" + topic_name;
-                }
-
-                if (param.compare("zone_topics") == 0) {
-                    _subs.push_back(nh.subscribe(topic_name, 100, &VirtualLayer::zoneCallback, this));
-                } else if (param.compare("obstacle_topics") == 0) {
-                    _subs.push_back(nh.subscribe(topic_name, 100, &VirtualLayer::obstaclesCallback, this));
-                }
-
-                ROS_INFO_STREAM(tag << "subscribed to topic " << _subs.back().getTopic().c_str());
+                res.success = false;
+                res.message = "Add element failed: [reason: request data corrupted]";
+                ROS_WARN_STREAM(tag << res.message);
+                return true;
             }
+        } break;
+
+        case GeometryType::POLYGON: {
+            auto has_form = req.form.data.find("POLYGON");
+            if (has_form != std::string::npos) {
+                rgk::core::Polygon polygon;
+                try {
+                    boost::geometry::read_wkt(req.form.data, polygon);
+                } catch (...) {
+                    res.success = false;
+                    res.message = "Add element failed: [reason: request data corrupted]";
+                    ROS_WARN_STREAM(tag << res.message);
+                    return true;
+                }
+                boost::geometry::correct(polygon);
+                if (polygon.outer().empty() && polygon.inners().empty()) {
+                    res.success = false;
+                    res.message = "Add element failed: [reason: request data empty]";
+                    ROS_WARN_STREAM(tag << res.message);
+                    return true;
+                }
+
+                const auto uuid = savePolygonGeometry(polygon, req.form.uuid);
+                res.success = true;
+                res.uuid = uuid;
+            } else {
+                res.success = false;
+                res.message = "Add element failed: [reason: request data corrupted]";
+                ROS_WARN_STREAM(tag << res.message);
+                return true;
+            }
+        } break;
+
+        case GeometryType::RING: {
+            auto has_form = req.form.data.find("POLYGON");
+            if (has_form != std::string::npos) {
+                rgk::core::Polygon polygon;
+                try {
+                    boost::geometry::read_wkt(req.form.data, polygon);
+                } catch (...) {
+                    res.success = false;
+                    res.message = "Add element failed: [reason: request data corrupted]";
+                    ROS_WARN_STREAM(tag << res.message);
+                    return true;
+                }
+                boost::geometry::correct(polygon);
+                if (polygon.outer().empty() && polygon.inners().empty()) {
+                    res.success = false;
+                    res.message = "Add element failed: [reason: request data empty]";
+                    ROS_WARN_STREAM(tag << res.message);
+                    return true;
+                }
+
+                if (!polygon.outer().empty() || polygon.inners().size() != 1) {
+                    res.success = false;
+                    res.message = "Add element failed: [reason: request data mismatched ring type]";
+                    ROS_WARN_STREAM(tag << res.message);
+                    return true;
+                }
+
+                const auto uuid = savePolygonGeometry(polygon, req.form.uuid);
+                res.success = true;
+                res.uuid = uuid;
+            } else {
+                res.success = false;
+                res.message = "Add element failed: [reason: request data corrupted]";
+                ROS_WARN_STREAM(tag << res.message);
+                return true;
+            }
+        } break;
+
+        case GeometryType::CIRCLE:
+            res.success = false;
+            res.message = "Circle type not implemented yet";
+            ROS_WARN_STREAM(tag << res.message);
+            return true;
+    }
+
+    // computeMapBounds();
+
+    return true;
+}
+
+// ---------------------------------------------------------------------
+
+bool VirtualLayer::removeElement(virtual_costmap_layer::RemoveElementRequest& req, virtual_costmap_layer::RemoveElementResponse& res)
+{
+    std::lock_guard<std::mutex> l(_data_mutex);
+
+    bool deleted = false;
+
+    auto process = [this, &deleted, &req](GeometryType type) {
+        if (_geometries[type].find(req.uuid) != _geometries[type].end()) {            
+            deleted = true;
+            _to_be_deleted_geometries[type].insert(std::make_pair(req.uuid, _geometries[type][req.uuid]));
+            _geometries[type].erase(req.uuid);
+            // computeMapBounds();
         }
+    };
+
+    process(GeometryType::LINESTRING);
+    if (deleted) {
+        res.success = true;
+        return true;
+    }
+
+    process(GeometryType::POLYGON);
+    if (deleted) {
+        res.success = true;
+        return true;
+    }
+
+    process(GeometryType::RING);
+    if (deleted) {
+        res.success = true;
+        return true;
+    }
+
+    process(GeometryType::CIRCLE);
+    if (deleted) {
+        res.success = true;
+        return true;
     } else {
-        ROS_ERROR_STREAM(tag << "cannot read " << param << " from parameter server");
+        res.success = false;
+        res.message = "No element with the given uuid";
+        return true;
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------
+
+bool VirtualLayer::clear(std_srvs::TriggerRequest& req, std_srvs::TriggerResponse& res)
+{
+    ROS_INFO_STREAM(tag << "Clearing layer");
+
+    std::lock_guard<std::mutex> l(_data_mutex);
+    
+    for (auto& geometry : _geometries) {
+        for (auto& item : geometry.second) {
+            _to_be_deleted_geometries[geometry.first].insert(item);
+        }
+    }
+
+    _geometries[GeometryType::LINESTRING].clear();
+    _geometries[GeometryType::POLYGON].clear();
+    _geometries[GeometryType::RING].clear();
+    _geometries[GeometryType::CIRCLE].clear();
+
+    // computeMapBounds();
+    res.success = true;
+    return true;
+}
+
+// ---------------------------------------------------------------------
+
+bool VirtualLayer::getElement(virtual_costmap_layer::GetElementRequest& req, virtual_costmap_layer::GetElementResponse& res)
+{
+    std::lock_guard<std::mutex> l(_data_mutex);
+
+    bool found = false;
+
+    auto process = [this, &found, &req, &res](GeometryType type) {
+        if (_geometries[type].find(req.uuid) != _geometries[type].end()) {
+            found = true;
+            res.form = toForm(_geometries[type][req.uuid], type);
+            res.form.uuid = req.uuid;
+        }
+    };
+
+    process(GeometryType::LINESTRING);
+    if (found) {
+        res.success = true;
+        return true;
+    }
+
+    process(GeometryType::POLYGON);
+    if (found) {
+        res.success = true;
+        return true;
+    }
+
+    process(GeometryType::RING);
+    if (found) {
+        res.success = true;
+        return true;
+    }
+
+    process(GeometryType::CIRCLE);
+    if (found) {
+        res.success = true;
+        return true;
+    } else {
+        res.success = false;
+        res.message = "No element with the given uuid";
+        return true;
     }
 }
 
 // ---------------------------------------------------------------------
 
-// load polygones, lines and points out of the rosparam server
-void VirtualLayer::parseFormListFromYaml(const ros::NodeHandle &nh, const std::string &param)
+bool VirtualLayer::getElements(virtual_costmap_layer::GetElementsRequest& req, virtual_costmap_layer::GetElementsResponse& res)
+{
+    std::lock_guard<std::mutex> l(_data_mutex);
+    
+    res.forms = toForms();
+    return true;
+}
+
+// ---------------------------------------------------------------------
+
+void VirtualLayer::parseFormListFromYaml(const ros::NodeHandle& nh)
 {
     XmlRpc::XmlRpcValue param_yaml;
+    std::string param = "forms";
     if (nh.getParam(param, param_yaml)) {
         if (param_yaml.getType() == XmlRpc::XmlRpcValue::TypeArray) {
-
             for (std::size_t i = 0; i < param_yaml.size(); ++i) {
-                geometry_msgs::Point point;
-                Polygon vector_to_add;
-                if (param_yaml[i].getType() == XmlRpc::XmlRpcValue::TypeArray) {
-                    if (param_yaml[i].size() == 1) { // add a point
-                        try {
-                            convert(param_yaml[i][0], point);
-                        } catch (...) {
-                            continue;
-                        }
-                        _form_points.push_back(point);
-                    } else if (param_yaml[i].size() == 2) {
-                        if (param_yaml[i][0].getType() == XmlRpc::XmlRpcValue::TypeDouble ||
-                            param_yaml[i][0].getType() == XmlRpc::XmlRpcValue::TypeInt) { // add a point
+                if (param_yaml[i].getType() == XmlRpc::XmlRpcValue::TypeString) {
+
+                    std::string value = std::string(param_yaml[i]);
+                    bool found = false;
+
+                    {
+                        auto has_form = value.find("LINESTRING");
+                        if (has_form != std::string::npos) {
+                            found = true;
+                            rgk::core::LineString linestring;
                             try {
-                                convert(param_yaml[i], point);
+                                boost::geometry::read_wkt(value, linestring);
                             } catch (...) {
+                                ROS_ERROR_STREAM(tag << param << " with index #" << i << " is corrupted [reason: geometry corrupted]");
                                 continue;
                             }
-                            _form_points.push_back(point);
-                        } else { // add a line
-                            vector_to_add.reserve(3);
-                            geometry_msgs::Point a;
-                            geometry_msgs::Point b;
-                            try {
-                                convert(param_yaml[i][0], a);
-                                convert(param_yaml[i][1], b);
-                            } catch (...) {
-                                continue;
-                            }
-                            vector_to_add.push_back(a);
-                            vector_to_add.push_back(b);
-
-                            // calculate the normal vector for AB
-                            geometry_msgs::Point n;
-                            n.x = b.y - a.y;
-                            n.y = a.x - b.x;
-                            // get the absolute value of N to normalize it and to set the length of the costmap resolution
-                            double abs_n = sqrt(pow(n.x, 2) + pow(n.y, 2));
-                            n.x = n.x / abs_n * _costmap_resolution;
-                            n.y = n.y / abs_n * _costmap_resolution;
-
-                            // calculate the new points to get a polygon which can be filled
-                            point.x = a.x + n.x;
-                            point.y = a.y + n.y;
-                            vector_to_add.push_back(point);
-
-                            point.x = b.x + n.x;
-                            point.y = b.y + n.y;
-                            vector_to_add.push_back(point);
-
-                            _form_polygons.push_back(vector_to_add);
-                        }
-                    } else if (param_yaml[i].size() >= 3) { // add a polygon
-                        vector_to_add.reserve(param_yaml[i].size());
-                        for (std::size_t j = 0; j < param_yaml[i].size(); ++j) {
-                            try {
-                                convert(param_yaml[i][j], point);
-                            } catch (...) {
-                                vector_to_add.clear();
-                                break;
-                            }
-                            vector_to_add.push_back(point);
-                        }
-                        if (!vector_to_add.empty()) {
-                            _form_polygons.push_back(vector_to_add);
+                            boost::geometry::correct(linestring);
+                            saveLineStringGeometry(linestring);
                         }
                     }
+
+                    if (found) {
+                        continue;
+                    }
+
+                    {
+                        auto has_form = value.find("POLYGON");
+                        if (has_form != std::string::npos) {
+                            found = true;
+                            rgk::core::Polygon polygon;
+                            try {
+                                boost::geometry::read_wkt(value, polygon);
+                            } catch (...) {
+                                ROS_ERROR_STREAM(tag << param << " with index #" << i << " is corrupted [reason: geometry corrupted]");
+                                continue;
+                            }
+                            boost::geometry::correct(polygon);
+                            savePolygonGeometry(polygon);
+                        }
+                    }
+
+                    if (found) {
+                        continue;
+                    }
+
+                    ROS_ERROR_STREAM(tag << param << " with index #" << i << " is corrupted [reason: geometry not supported]");
                 } else {
-                    ROS_ERROR_STREAM(tag << param << " with index #" << i << " is corrupted");
+                    ROS_ERROR_STREAM(tag << param << " with index #" << i << " is corrupted [reason: not a string type]");
                 }
             }
 
         } else {
             ROS_ERROR_STREAM(tag << param << "struct is corrupted");
         }
-
     } else {
         ROS_ERROR_STREAM(tag << "could not read " << param << " from parameter server");
     }
@@ -197,82 +468,203 @@ void VirtualLayer::parseFormListFromYaml(const ros::NodeHandle &nh, const std::s
 
 // ---------------------------------------------------------------------
 
-// get a point out of the XML Type into a geometry_msgs::Point
-void VirtualLayer::convert(const XmlRpc::XmlRpcValue &val, geometry_msgs::Point &point)
+std::string VirtualLayer::saveLineStringGeometry(const rgk::core::LineString& linestring, std::string uuid)
 {
-    try {
-        // check if there a two values for the coordinate
-        if (val.getType() == XmlRpc::XmlRpcValue::TypeArray && val.size() == 2) {
-            auto convDouble = [](const XmlRpc::XmlRpcValue &val) -> double {
-                auto val_copy = val;
-                if (val_copy.getType() == XmlRpc::XmlRpcValue::TypeInt) // XmlRpc cannot cast int to double
-                {
+    if (uuid.empty())
+    {
+        auto process = [this, &uuid]() {
+            if (_geometries[GeometryType::LINESTRING].find(uuid) != _geometries[GeometryType::LINESTRING].end()) {
+                return false;
+            }
+            if (_geometries[GeometryType::RING].find(uuid) != _geometries[GeometryType::RING].end()) {
+                return false;
+            }
+            if (_geometries[GeometryType::RING].find(uuid) != _geometries[GeometryType::RING].end()) {
+                return false;
+            }
+            if (_geometries[GeometryType::CIRCLE].find(uuid) != _geometries[GeometryType::CIRCLE].end()) {
+                return false;
+            }
+            return true;
+        };
 
-                    return int(val_copy);
-                }
-                return val_copy; // if not double, an exception is thrown;
-            };
+        uuid = getUUID();
+        while(not process())
+        {
+            uuid = getUUID();
+        }        
+    }
 
-            point.x = convDouble(val[0]);
-            point.y = convDouble(val[1]);
-            point.z = 0.0;
+    Geometry geometry;
+    geometry._linestring = linestring;
+    geometry._new = true;
+    ROS_INFO_STREAM(tag << "Adding LineString [uuid: " << uuid << "]");
+    _geometries[GeometryType::LINESTRING].insert(std::make_pair(uuid, geometry));
+
+    return uuid;
+}
+
+// ---------------------------------------------------------------------
+
+std::string VirtualLayer::savePolygonGeometry(const rgk::core::Polygon& polygon, std::string uuid)
+{
+    if (uuid.empty())
+    {
+        auto process = [this, &uuid]() {
+            if (_geometries[GeometryType::LINESTRING].find(uuid) != _geometries[GeometryType::LINESTRING].end()) {
+                return false;
+            }
+            if (_geometries[GeometryType::RING].find(uuid) != _geometries[GeometryType::RING].end()) {
+                return false;
+            }
+            if (_geometries[GeometryType::RING].find(uuid) != _geometries[GeometryType::RING].end()) {
+                return false;
+            }
+            if (_geometries[GeometryType::CIRCLE].find(uuid) != _geometries[GeometryType::CIRCLE].end()) {
+                return false;
+            }
+            return true;
+        };
+
+        uuid = getUUID();
+        while(not process())
+        {
+            uuid = getUUID();
+        }        
+    }
+
+    Geometry geometry;
+    geometry._new = true;
+
+    if (polygon.outer().empty() && polygon.inners().size() == 1) {
+        if (_enable_tessellation) {
+            rgk::tessellator::Tessellator tessellator;
+            rgk::core::Polygon p;
+            p.outer() = polygon.inners()[0];
+            geometry._tessellated_ring = tessellator.process(p);
+            geometry._ring = polygon.inners()[0];
+            geometry._tessellated = true;
+            ROS_INFO_STREAM(tag << "Adding Ring [uuid: " << uuid << "] [tessellated: " << geometry._tessellated_ring.value().size() << "]");
+            _geometries[GeometryType::RING].insert(std::make_pair(uuid, geometry));
         } else {
-            ROS_ERROR_STREAM(tag << "a point has to contain two double values");
-            throw std::runtime_error("a point has to contain two double values");
+            ROS_INFO_STREAM(tag << "Adding Ring [uuid: " << uuid << "]");
+            geometry._ring = polygon.inners()[0];
+            geometry._tessellated = false;
+            _geometries[GeometryType::RING].insert(std::make_pair(uuid, geometry));
         }
-    } catch (const XmlRpc::XmlRpcException &ex) {
-        ROS_ERROR_STREAM(tag << "could not convert point: [" << ex.getMessage() << "]");
-        throw std::runtime_error("could not convert point: [" + ex.getMessage() + "]");
+
+    } else {
+        ROS_INFO_STREAM(tag << "Adding Polygon [uuid: " << uuid << "]");
+        geometry._polygon = polygon;
+        _geometries[GeometryType::POLYGON].insert(std::make_pair(uuid, geometry));
     }
+
+    return uuid;
 }
 
 // ---------------------------------------------------------------------
 
-bool VirtualLayer::robotInZone(const Polygon &zone)
+virtual_costmap_layer::Form VirtualLayer::toForm(const Geometry& geometry, GeometryType type) const
 {
-    if (!_one_zone_mode) {
-        ROS_WARN_STREAM(tag << "could be applied only for one_zone_mode");
-        return true;
+    virtual_costmap_layer::Form form;
+    switch (type) {
+        case GeometryType::LINESTRING: {
+            form.type = virtual_costmap_layer::Form::TYPE_LINESTRING;
+            std::stringstream ss;
+            ss << boost::geometry::wkt(geometry._linestring.value());
+            form.data = ss.str();
+            form.description = "TYPE_LINESTRING";
+        } break;
+
+        case GeometryType::POLYGON: {
+            form.type = virtual_costmap_layer::Form::TYPE_POLYGON;
+            std::stringstream ss;
+            ss << boost::geometry::wkt(geometry._polygon.value());
+            form.data = ss.str();
+            form.description = "TYPE_POLYGON";
+        } break;
+
+        case GeometryType::RING: {
+            form.type = virtual_costmap_layer::Form::TYPE_RING;
+            rgk::core::Polygon polygon;
+            polygon.inners().reserve(1);
+            polygon.inners().push_back(geometry._ring.value());
+            std::stringstream ss;
+            ss << boost::geometry::wkt(polygon);
+            form.data = ss.str();
+            form.description = "TYPE_RING";
+        } break;
+
+        case GeometryType::CIRCLE:
+            // form.type = virtual_costmap_layer::Form::TYPE_CIRCLE;
+            // form.data=
+            break;
     }
 
-    geometry_msgs::Point point = getRobotPoint();
-    std::size_t i, j;
-    std::size_t size = zone.size();
-    bool result = false;
-
-    for (i = 0, j = size - 1; i < size; j = ++i) {
-        if (((zone[i].y > point.y) != (zone[j].y > point.y)) &&
-            (point.x < (zone[j].x - zone[i].x) * (point.y - zone[i].y) / (zone[j].y - zone[i].y) + zone[i].x)) {
-            result = !result;
-        }
-    }
-
-    return result;
+    return form;
 }
 
 // ---------------------------------------------------------------------
 
-void VirtualLayer::reconfigureCb(VirtualLayerConfig &config, uint32_t level)
+std::vector<virtual_costmap_layer::Form> VirtualLayer::toForms() const
+{
+    auto size = _geometries.at(GeometryType::LINESTRING).size() +
+                _geometries.at(GeometryType::POLYGON).size() +
+                _geometries.at(GeometryType::RING).size() +
+                _geometries.at(GeometryType::CIRCLE).size();
+
+    std::vector<virtual_costmap_layer::Form> forms;
+    forms.reserve(size);
+
+    auto process = [this, &forms](GeometryType type) {
+        for (const auto& pair : _geometries.at(type)) {
+            auto form = toForm(pair.second, type);
+            form.uuid = pair.first;
+            forms.push_back(form);
+        }
+    };
+
+    process(GeometryType::LINESTRING);
+    process(GeometryType::POLYGON);
+    process(GeometryType::RING);
+    process(GeometryType::CIRCLE);
+
+    return forms;
+}
+
+// ---------------------------------------------------------------------
+
+void VirtualLayer::reconfigureCb(VirtualLayerConfig& config, uint32_t level)
 {
     enabled_ = config.enabled;
-    _one_zone_mode = config.one_zone;
-    _clear_obstacles = config.clear_obstacles;
     _base_frame = config.base_frame;
     _map_frame = config.map_frame;
 }
 
-void VirtualLayer::updateBounds(double robot_x, double robot_y, double robot_yaw,
-                                double *min_x, double *min_y, double *max_x, double *max_y)
-{
-    if (!enabled_) {
-        return;
-    }
+// ---------------------------------------------------------------------
 
+void VirtualLayer::updateBounds(double robot_x, double robot_y, double robot_yaw,
+                                double* min_x, double* min_y, double* max_x, double* max_y)
+{
     std::lock_guard<std::mutex> l(_data_mutex);
 
-    if (_obstacle_points.empty() && _zone_polygons.empty() && _obstacle_polygons.empty()) {
+    auto size = _geometries.at(GeometryType::LINESTRING).size() +
+                _geometries.at(GeometryType::POLYGON).size() +
+                _geometries.at(GeometryType::RING).size() +
+                _geometries.at(GeometryType::CIRCLE).size();
+
+    auto to_be_deleted_size = _to_be_deleted_geometries.at(GeometryType::LINESTRING).size() +
+                                _to_be_deleted_geometries.at(GeometryType::POLYGON).size() +
+                                _to_be_deleted_geometries.at(GeometryType::RING).size() +
+                                _to_be_deleted_geometries.at(GeometryType::CIRCLE).size();
+
+    if (size == 0 && to_be_deleted_size == 0) {
         return;
     }
+
+    computeMapBounds(_last_enabled != enabled_);
+    
+    _last_enabled = enabled_;
 
     *min_x = std::min(*min_x, _min_x);
     *min_y = std::min(*min_y, _min_y);
@@ -280,7 +672,9 @@ void VirtualLayer::updateBounds(double robot_x, double robot_y, double robot_yaw
     *max_y = std::max(*max_y, _max_y);
 }
 
-void VirtualLayer::updateCosts(costmap_2d::Costmap2D &master_grid, int min_i, int min_j, int max_i, int max_j)
+// ---------------------------------------------------------------------
+
+void VirtualLayer::updateCosts(costmap_2d::Costmap2D& grid, int min_i, int min_j, int max_i, int max_j)
 {
     if (!enabled_) {
         return;
@@ -288,115 +682,230 @@ void VirtualLayer::updateCosts(costmap_2d::Costmap2D &master_grid, int min_i, in
 
     std::lock_guard<std::mutex> l(_data_mutex);
 
-    // set costs of zone polygons
-    for (int i = 0; i < _zone_polygons.size(); ++i) {
-        setPolygonCost(master_grid, _zone_polygons[i], costmap_2d::LETHAL_OBSTACLE, min_i, min_j, max_i, max_j, false);
+    // set costs of polygons
+    for (const auto& pair : _geometries[GeometryType::POLYGON]) {
+        if (pair.second._polygon) {
+            setRingCost(grid, pair.second._polygon.value().outer(),
+                        costmap_2d::LETHAL_OBSTACLE,
+                        min_i, min_j, max_i, max_j,
+                        false);
+
+            for (const auto& inner : pair.second._polygon.value().inners()) {
+                setRingCost(grid, inner,
+                            costmap_2d::LETHAL_OBSTACLE,
+                            min_i, min_j, max_i, max_j,
+                            true);
+            }
+        }
     }
 
-    // set costs of obstacle polygons
-    for (int i = 0; i < _obstacle_polygons.size(); ++i) {
-        setPolygonCost(master_grid, _obstacle_polygons[i], costmap_2d::LETHAL_OBSTACLE, min_i, min_j, max_i, max_j, true);
+    // set costs of rings
+    for (const auto& pair : _geometries[GeometryType::RING]) {
+        if (pair.second._ring) {
+            if (!pair.second._tessellated) {
+                setRingCost(grid, pair.second._ring.value(),
+                            costmap_2d::LETHAL_OBSTACLE,
+                            min_i, min_j, max_i, max_j,
+                            true);
+            } else if (pair.second._tessellated_ring) {
+                for (const auto& ring : pair.second._tessellated_ring.value()) {
+                    setRingCost(grid, ring,
+                                costmap_2d::LETHAL_OBSTACLE,
+                                min_i, min_j, max_i, max_j,
+                                true);
+                }
+            }
+        }
     }
 
-    // set cost of obstacle points
-    for (int i = 0; i < _obstacle_points.size(); ++i) {
-        unsigned int mx;
-        unsigned int my;
-        if (master_grid.worldToMap(_obstacle_points[i].x, _obstacle_points[i].y, mx, my)) {
-            master_grid.setCost(mx, my, costmap_2d::LETHAL_OBSTACLE);
+    // set costs of linestrings
+    for (const auto& pair : _geometries[GeometryType::LINESTRING]) {
+        if (pair.second._linestring) {
+            setLineStringCost(grid, pair.second._linestring.value(),
+                              costmap_2d::LETHAL_OBSTACLE,
+                              min_i, min_j, max_i, max_j);
         }
     }
 }
 
-void VirtualLayer::computeMapBounds()
+// ---------------------------------------------------------------------
+
+void VirtualLayer::setRingCost(costmap_2d::Costmap2D& grid,
+                               const rgk::core::Ring& ring,
+                               unsigned char cost,
+                               int min_i, int min_j, int max_i, int max_j,
+                               bool fill) const
 {
-    std::lock_guard<std::mutex> l(_data_mutex);
 
-    // reset bounds
-    _min_x = _min_y = _max_x = _max_y = 0;
-
-    // iterate zone polygons
-    for (int i = 0; i < _zone_polygons.size(); ++i) {
-        for (int j = 0; j < _zone_polygons.at(i).size(); ++j) {
-            double px = _zone_polygons.at(i).at(j).x;
-            double py = _zone_polygons.at(i).at(j).y;
-            _min_x = std::min(px, _min_x);
-            _min_y = std::min(py, _min_y);
-            _max_x = std::max(px, _max_x);
-            _max_y = std::max(py, _max_y);
-        }
-    }
-
-    // iterate obstacle polygons
-    for (int i = 0; i < _obstacle_polygons.size(); ++i) {
-        for (int j = 0; j < _obstacle_polygons.at(i).size(); ++j) {
-            double px = _obstacle_polygons.at(i).at(j).x;
-            double py = _obstacle_polygons.at(i).at(j).y;
-            _min_x = std::min(px, _min_x);
-            _min_y = std::min(py, _min_y);
-            _max_x = std::max(px, _max_x);
-            _max_y = std::max(py, _max_y);
-        }
-    }
-
-    // iterate obstacle points
-    for (int i = 0; i < _obstacle_points.size(); ++i) {
-        double px = _obstacle_points.at(i).x;
-        double py = _obstacle_points.at(i).y;
-        _min_x = std::min(px, _min_x);
-        _min_y = std::min(py, _min_y);
-        _max_x = std::max(px, _max_x);
-        _max_y = std::max(py, _max_y);
-    }
-}
-
-void VirtualLayer::setPolygonCost(costmap_2d::Costmap2D &master_grid, const Polygon &polygon, unsigned char cost,
-                                  int min_i, int min_j, int max_i, int max_j, bool fill_polygon)
-{
-    std::vector<PointInt> map_polygon;
-    for (unsigned int i = 0; i < polygon.size(); ++i) {
+    std::vector<PointInt> map;
+    for (const auto& point : ring) {
         PointInt loc;
-        master_grid.worldToMapNoBounds(polygon[i].x, polygon[i].y, loc.x, loc.y);
-        map_polygon.push_back(loc);
+        grid.worldToMapNoBounds(boost::geometry::get<0>(point), boost::geometry::get<1>(point), loc.x, loc.y);
+        map.push_back(loc);
     }
 
-    std::vector<PointInt> polygon_cells;
+    std::vector<PointInt> cells;
 
-    // get the cells that fill the polygon
-    rasterizePolygon(map_polygon, polygon_cells, fill_polygon);
+    // get the cells
+    rasterize(map, cells, fill);
 
     // set the cost of those cells
-    for (unsigned int i = 0; i < polygon_cells.size(); ++i) {
-        int mx = polygon_cells[i].x;
-        int my = polygon_cells[i].y;
+    for (const auto& cell : cells) {
+        int mx = cell.x;
+        int my = cell.y;
         // check if point is outside bounds
-        if (mx < min_i || mx >= max_i)
+        if (mx < min_i || mx >= max_i) {
             continue;
-        if (my < min_j || my >= max_j)
+        }
+        if (my < min_j || my >= max_j) {
             continue;
-        master_grid.setCost(mx, my, cost);
+        }
+        grid.setCost(mx, my, cost);
     }
 }
 
-void VirtualLayer::polygonOutlineCells(const std::vector<PointInt> &polygon, std::vector<PointInt> &polygon_cells)
+// ---------------------------------------------------------------------
+
+void VirtualLayer::setLineStringCost(costmap_2d::Costmap2D& grid,
+                                     const rgk::core::LineString& linestring,
+                                     unsigned char cost,
+                                     int min_i, int min_j, int max_i, int max_j) const
 {
-    for (unsigned int i = 0; i < polygon.size() - 1; ++i) {
-        raytrace(polygon[i].x, polygon[i].y, polygon[i + 1].x, polygon[i + 1].y, polygon_cells);
+    std::vector<PointInt> map;
+    for (const auto& point : linestring) {
+        PointInt loc;
+        grid.worldToMapNoBounds(boost::geometry::get<0>(point), boost::geometry::get<1>(point), loc.x, loc.y);
+        map.push_back(loc);
     }
-    if (!polygon.empty()) {
-        unsigned int last_index = polygon.size() - 1;
+
+    std::vector<PointInt> cells;
+
+    // get the cells
+    rasterize(map, cells);
+
+    // set the cost of those cells
+    for (const auto& cell : cells) {
+        int mx = cell.x;
+        int my = cell.y;
+        // check if point is outside bounds
+        if (mx < min_i || mx >= max_i) {
+            continue;
+        }
+        if (my < min_j || my >= max_j) {
+            continue;
+        }
+        grid.setCost(mx, my, cost);
+    }
+}
+
+// ---------------------------------------------------------------------
+
+void VirtualLayer::rasterize(const std::vector<PointInt>& ring, std::vector<PointInt>& cells, bool fill) const
+{
+    //we need a minimum point if the ring
+    if (ring.size() < 3) {
+        return;
+    }
+
+    //first get the cells that make up the outline of the polygon
+    outlineCells(ring, cells);
+
+    if (!fill) {
+        return;
+    }
+
+    //quick bubble sort to sort points by x
+    PointInt swap;
+    unsigned int i = 0;
+    while (i < cells.size() - 1) {
+        if (cells[i].x > cells[i + 1].x) {
+            swap = cells[i];
+            cells[i] = cells[i + 1];
+            cells[i + 1] = swap;
+
+            if (i > 0) {
+                --i;
+            }
+        } else {
+            ++i;
+        }
+    }
+
+    i = 0;
+    PointInt min_pt;
+    PointInt max_pt;
+    int min_x = cells[0].x;
+    int max_x = cells[(int)cells.size() - 1].x;
+
+    //walk through each column and mark cells inside the polygon
+    for (int x = min_x; x <= max_x; ++x) {
+        if (i >= (int)cells.size() - 1) {
+            break;
+        }
+
+        if (cells[i].y < cells[i + 1].y) {
+            min_pt = cells[i];
+            max_pt = cells[i + 1];
+        } else {
+            min_pt = cells[i + 1];
+            max_pt = cells[i];
+        }
+
+        i += 2;
+        while (i < cells.size() && cells[i].x == x) {
+            if (cells[i].y < min_pt.y) {
+                min_pt = cells[i];
+            } else if (cells[i].y > max_pt.y) {
+                max_pt = cells[i];
+            }
+            ++i;
+        }
+
+        PointInt pt;
+        //loop though cells in the column
+        for (int y = min_pt.y; y < max_pt.y; ++y) {
+            pt.x = x;
+            pt.y = y;
+            cells.push_back(pt);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+
+void VirtualLayer::rasterize(const std::vector<PointInt>& linestring, std::vector<PointInt>& cells) const
+{
+    for (std::size_t i = 0; i < linestring.size() - 1; ++i) {
+        raytrace(linestring[i].x, linestring[i].y, linestring[i + 1].x, linestring[i + 1].y, cells);
+    }
+}
+
+// ---------------------------------------------------------------------
+
+void VirtualLayer::outlineCells(const std::vector<PointInt>& ring, std::vector<PointInt>& cells) const
+{
+    for (std::size_t i = 0; i < ring.size() - 1; ++i) {
+        raytrace(ring[i].x, ring[i].y, ring[i + 1].x, ring[i + 1].y, cells);
+    }
+
+    if (!ring.empty()) {
+        unsigned int last_index = ring.size() - 1;
         // we also need to close the polygon by going from the last point to the first
-        raytrace(polygon[last_index].x, polygon[last_index].y, polygon[0].x, polygon[0].y, polygon_cells);
+        raytrace(ring[last_index].x, ring[last_index].y, ring[0].x, ring[0].y, cells);
     }
 }
 
-void VirtualLayer::raytrace(int x0, int y0, int x1, int y1, std::vector<PointInt> &cells)
+// ---------------------------------------------------------------------
+
+void VirtualLayer::raytrace(int x0, int y0, int x1, int y1, std::vector<PointInt>& cells) const
 {
-    int dx = abs(x1 - x0);
-    int dy = abs(y1 - y0);
+    int dx = std::abs(x1 - x0);
+    int dy = std::abs(y1 - y0);
+
     PointInt pt;
     pt.x = x0;
     pt.y = y0;
+
     int n = 1 + dx + dy;
     int x_inc = (x1 > x0) ? 1 : -1;
     int y_inc = (y1 > y0) ? 1 : -1;
@@ -417,187 +926,157 @@ void VirtualLayer::raytrace(int x0, int y0, int x1, int y1, std::vector<PointInt
     }
 }
 
-void VirtualLayer::rasterizePolygon(const std::vector<PointInt> &polygon, std::vector<PointInt> &polygon_cells, bool fill)
+// ---------------------------------------------------------------------
+
+void VirtualLayer::computeMapBounds(bool include_all)
 {
-    // this implementation is a slighly modified version of Costmap2D::convexFillCells(...)
+    // std::lock_guard<std::mutex> l(_data_mutex);
 
-    //we need a minimum polygon of a traingle
-    if (polygon.size() < 3)
-        return;
+    // reset bounds
+    _min_x = _min_y = 1e30;
+    _max_x = _max_y = -1e30;
 
-    //first get the cells that make up the outline of the polygon
-    polygonOutlineCells(polygon, polygon_cells);
+    // iterate on polygons
+    for (auto& pair : _geometries[GeometryType::POLYGON]) {
+        if (pair.second._polygon && (pair.second._new || include_all)) {
+            for (const auto& point : pair.second._polygon.value().outer()) {
+                double px = boost::geometry::get<0>(point);
+                double py = boost::geometry::get<1>(point);
+                _min_x = std::min(px, _min_x);
+                _min_y = std::min(py, _min_y);
+                _max_x = std::max(px, _max_x);
+                _max_y = std::max(py, _max_y);
+            }
 
-    if (!fill)
-        return;
-
-    //quick bubble sort to sort points by x
-    PointInt swap;
-    unsigned int i = 0;
-    while (i < polygon_cells.size() - 1) {
-        if (polygon_cells[i].x > polygon_cells[i + 1].x) {
-            swap = polygon_cells[i];
-            polygon_cells[i] = polygon_cells[i + 1];
-            polygon_cells[i + 1] = swap;
-
-            if (i > 0)
-                --i;
-        } else
-            ++i;
-    }
-
-    i = 0;
-    PointInt min_pt;
-    PointInt max_pt;
-    int min_x = polygon_cells[0].x;
-    int max_x = polygon_cells[(int)polygon_cells.size() - 1].x;
-
-    //walk through each column and mark cells inside the polygon
-    for (int x = min_x; x <= max_x; ++x) {
-        if (i >= (int)polygon_cells.size() - 1)
-            break;
-
-        if (polygon_cells[i].y < polygon_cells[i + 1].y) {
-            min_pt = polygon_cells[i];
-            max_pt = polygon_cells[i + 1];
-        } else {
-            min_pt = polygon_cells[i + 1];
-            max_pt = polygon_cells[i];
-        }
-
-        i += 2;
-        while (i < polygon_cells.size() && polygon_cells[i].x == x) {
-            if (polygon_cells[i].y < min_pt.y)
-                min_pt = polygon_cells[i];
-            else if (polygon_cells[i].y > max_pt.y)
-                max_pt = polygon_cells[i];
-            ++i;
-        }
-
-        PointInt pt;
-        //loop though cells in the column
-        for (int y = min_pt.y; y < max_pt.y; ++y) {
-            pt.x = x;
-            pt.y = y;
-            polygon_cells.push_back(pt);
-        }
-    }
-}
-
-void VirtualLayer::zoneCallback(const custom_msgs::ZoneConstPtr &zone_msg)
-{
-    if (zone_msg->area.form.size() > 2) {
-        Polygon vector_to_add;
-        for (int i = 0; i < zone_msg->area.form.size(); ++i) {
-            vector_to_add.push_back(zone_msg->area.form[i]);
-        }
-
-        if (!robotInZone(vector_to_add)) {
-            ROS_WARN_STREAM(tag << "Robot point is not the navigation zone");
-            return;
-        }
-
-        if (_one_zone_mode) {
-            _zone_polygons.clear();
-        }
-        _zone_polygons.push_back(vector_to_add);
-
-        computeMapBounds();
-    } else {
-        ROS_ERROR_STREAM(tag << "A zone Layer needs to be a polygon with minimun 3 edges");
-    }
-}
-
-void VirtualLayer::obstaclesCallback(const custom_msgs::ObstaclesConstPtr &obstacles_msg)
-{
-    if (_clear_obstacles) {
-        _obstacle_polygons.clear();
-        _obstacle_points.clear();
-    }
-
-    for (int i = 0; i < obstacles_msg->list.size(); ++i) {
-        Polygon vector_to_add;
-        if (obstacles_msg->list[i].form.size() == 1) {
-            if (obstacles_msg->list[i].form[0].z == 0.0) {
-                ROS_INFO_STREAM(tag << "Adding a Point");
-                _obstacle_points.push_back(obstacles_msg->list[i].form[0]);
-            } else if (obstacles_msg->list[i].form[0].z > 0.0) {
-                ROS_INFO_STREAM(tag << "Adding a Circle");
-                // Loop over 36 angles around a circle making a point each time
-                int N = 36;
-                geometry_msgs::Point pt;
-                for (int j = 0; j < N; ++j) {
-                    double angle = j * 2 * M_PI / N;
-                    pt.x = obstacles_msg->list[i].form[0].x + cos(angle) * obstacles_msg->list[i].form[0].z;
-                    pt.y = obstacles_msg->list[i].form[0].y + sin(angle) * obstacles_msg->list[i].form[0].z;
-                    vector_to_add.push_back(pt);
+            for (const auto& inner : pair.second._polygon.value().inners()) {
+                for (const auto& point : inner) {
+                    double px = boost::geometry::get<0>(point);
+                    double py = boost::geometry::get<1>(point);
+                    _min_x = std::min(px, _min_x);
+                    _min_y = std::min(py, _min_y);
+                    _max_x = std::max(px, _max_x);
+                    _max_y = std::max(py, _max_y);
                 }
-                _obstacle_polygons.push_back(vector_to_add);
             }
-        } else if (obstacles_msg->list[i].form.size() == 2) {
-            ROS_INFO_STREAM(tag << "Adding a Line");
 
-            geometry_msgs::Point point_A = obstacles_msg->list[i].form[0];
-            geometry_msgs::Point point_B = obstacles_msg->list[i].form[1];
-            vector_to_add.push_back(point_A);
-            vector_to_add.push_back(point_B);
-
-            // calculate the normal vector for AB
-            geometry_msgs::Point point_N;
-            point_N.x = point_B.y - point_A.y;
-            point_N.y = point_A.x - point_B.x;
-
-            // get the absolute value of N to normalize and get
-            // it to the length of the costmap resolution
-            double abs_N = sqrt(pow(point_N.x, 2) + pow(point_N.y, 2));
-            point_N.x = point_N.x / abs_N * _costmap_resolution;
-            point_N.y = point_N.y / abs_N * _costmap_resolution;
-
-            // calculate the new points to get a polygon which can be filled
-            geometry_msgs::Point point;
-            point.x = point_A.x + point_N.x;
-            point.y = point_A.y + point_N.y;
-            vector_to_add.push_back(point);
-
-            point.x = point_B.x + point_N.x;
-            point.y = point_B.y + point_N.y;
-            vector_to_add.push_back(point);
-
-            _obstacle_polygons.push_back(vector_to_add);
-        } else {
-            ROS_INFO_STREAM(tag << "Adding a Polygon");
-            for (int j = 0; j < obstacles_msg->list[i].form.size(); ++j) {
-                vector_to_add.push_back(obstacles_msg->list[i].form[j]);
-            }
-            _obstacle_polygons.push_back(vector_to_add);
+            pair.second._new = false;
         }
     }
-    computeMapBounds();
-}
 
-geometry_msgs::Point VirtualLayer::getRobotPoint()
-{
-    tf::TransformListener tfListener;
-    geometry_msgs::PoseStamped current_robot_pose, current_robot_pose_base;
-    geometry_msgs::Point robot_point;
-    geometry_msgs::TransformStamped current_transform_msg;
-    tf::StampedTransform current_transform_tf;
-    try {
-        ros::Time now = ros::Time(0);
-        tfListener.waitForTransform(_map_frame, _base_frame, now, ros::Duration(1.0));
-        now = ros::Time::now();
-        tfListener.getLatestCommonTime(_map_frame, _base_frame, now, nullptr);
-        current_robot_pose_base.header.stamp = now;
-        current_robot_pose_base.header.frame_id = _base_frame;
-        current_robot_pose_base.pose.orientation = tf::createQuaternionMsgFromYaw(0);
+    // iterate on soon to be deleted polygons
+    for (const auto& pair : _to_be_deleted_geometries[GeometryType::POLYGON]) {
+        if (pair.second._polygon) {
+            for (const auto& point : pair.second._polygon.value().outer()) {
+                double px = boost::geometry::get<0>(point);
+                double py = boost::geometry::get<1>(point);
+                _min_x = std::min(px, _min_x);
+                _min_y = std::min(py, _min_y);
+                _max_x = std::max(px, _max_x);
+                _max_y = std::max(py, _max_y);
+            }
 
-        tfListener.transformPose(_map_frame, current_robot_pose_base, current_robot_pose);
-        robot_point.x = current_robot_pose.pose.position.x;
-        robot_point.y = current_robot_pose.pose.position.y;
-        robot_point.z = 0.0;
-    } catch (tf::TransformException &ex) {
-        ROS_DEBUG_STREAM(tag << "Can't get robot pose: " << ex.what());
+            for (const auto& inner : pair.second._polygon.value().inners()) {
+                for (const auto& point : inner) {
+                    double px = boost::geometry::get<0>(point);
+                    double py = boost::geometry::get<1>(point);
+                    _min_x = std::min(px, _min_x);
+                    _min_y = std::min(py, _min_y);
+                    _max_x = std::max(px, _max_x);
+                    _max_y = std::max(py, _max_y);
+                }
+            }
+        }
     }
-    return robot_point;
+    _to_be_deleted_geometries[GeometryType::POLYGON].clear();
+
+    // iterate on rings
+    for (auto& pair : _geometries[GeometryType::RING]) {
+        if (pair.second._ring && (pair.second._new || include_all)) {
+            if (!pair.second._tessellated) {
+                for (const auto& point : pair.second._ring.value()) {
+                    double px = boost::geometry::get<0>(point);
+                    double py = boost::geometry::get<1>(point);
+                    _min_x = std::min(px, _min_x);
+                    _min_y = std::min(py, _min_y);
+                    _max_x = std::max(px, _max_x);
+                    _max_y = std::max(py, _max_y);
+                }
+            } else if (pair.second._tessellated_ring) {
+                for (const auto& ring : pair.second._tessellated_ring.value()) {
+                    for (const auto& point : pair.second._ring.value()) {
+                        double px = boost::geometry::get<0>(point);
+                        double py = boost::geometry::get<1>(point);
+                        _min_x = std::min(px, _min_x);
+                        _min_y = std::min(py, _min_y);
+                        _max_x = std::max(px, _max_x);
+                        _max_y = std::max(py, _max_y);
+                    }
+                }
+            }
+
+            pair.second._new = false;
+        }
+    }
+
+    // iterate on soon to be deleted rings
+    for (const auto& pair : _to_be_deleted_geometries[GeometryType::RING]) {
+        if (pair.second._ring) {
+            if (!pair.second._tessellated) {
+                for (const auto& point : pair.second._ring.value()) {
+                    double px = boost::geometry::get<0>(point);
+                    double py = boost::geometry::get<1>(point);
+                    _min_x = std::min(px, _min_x);
+                    _min_y = std::min(py, _min_y);
+                    _max_x = std::max(px, _max_x);
+                    _max_y = std::max(py, _max_y);
+                }
+            } else if (pair.second._tessellated_ring) {
+                for (const auto& ring : pair.second._tessellated_ring.value()) {
+                    for (const auto& point : pair.second._ring.value()) {
+                        double px = boost::geometry::get<0>(point);
+                        double py = boost::geometry::get<1>(point);
+                        _min_x = std::min(px, _min_x);
+                        _min_y = std::min(py, _min_y);
+                        _max_x = std::max(px, _max_x);
+                        _max_y = std::max(py, _max_y);
+                    }
+                }
+            }
+        }
+    }
+    _to_be_deleted_geometries[GeometryType::RING].clear();
+
+    // iterate on linestrings
+    for (auto& pair : _geometries[GeometryType::LINESTRING]) {
+        if (pair.second._linestring && (pair.second._new || include_all)) {
+            for (const auto& point : pair.second._linestring.value()) {
+                double px = boost::geometry::get<0>(point);
+                double py = boost::geometry::get<1>(point);
+                _min_x = std::min(px, _min_x);
+                _min_y = std::min(py, _min_y);
+                _max_x = std::max(px, _max_x);
+                _max_y = std::max(py, _max_y);
+            }
+
+            pair.second._new = false;
+        }
+    }
+
+    // iterate on soon to be deleted linestrings
+
+    for (const auto& pair : _to_be_deleted_geometries[GeometryType::LINESTRING]) {
+        if (pair.second._linestring) {
+            for (const auto& point : pair.second._linestring.value()) {
+                double px = boost::geometry::get<0>(point);
+                double py = boost::geometry::get<1>(point);
+                _min_x = std::min(px, _min_x);
+                _min_y = std::min(py, _min_y);
+                _max_x = std::max(px, _max_x);
+                _max_y = std::max(py, _max_y);
+            }
+        }
+    }
+    _to_be_deleted_geometries[GeometryType::LINESTRING].clear();
 }
+
 } // namespace virtual_costmap_layer
